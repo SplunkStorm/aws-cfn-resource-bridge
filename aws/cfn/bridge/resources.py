@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #==============================================================================
+import importlib
 import re
+
 from .processes import ProcessHelper
 from . import util
 from .vendored.botocore import session as bc_session
@@ -46,6 +48,8 @@ _OPTION_RESOURCE_TYPE = 'resource_type'
 
 _OPTION_REGION = 'region'
 
+_OPTION_CONFIG_PROVIDER = 'config_provider'
+
 # Our default timeout, set to 30 minutes
 _DEFAULT_TIMEOUT = 30 * 60
 
@@ -56,21 +60,9 @@ class CustomResource(object):
         self._source_file = source_file
         self._name = name
 
-        # Ensure a queue url has been defined
         self._queue_url = options.get(_OPTION_QUEUE_URL, None)
-        if not self._queue_url:
-            raise ValueError(u"[%s] in '%s' is missing 'queue_url' attribute" % (name, source_file))
 
-        self._region = None
-
-        # Try to parse the region from the queues/sqs prefixed urls.
-        region_match = re.match(r"https?://(?:queue|sqs)\.([^.]+?)\.amazonaws\..+", self._queue_url, re.I | re.U)
-        if region_match:
-            self._region = region_match.group(1)
-
-        self._region = options.get(_OPTION_REGION, self._region)
-        if not self._region:
-            raise ValueError(u"[%s] in '%s' must define 'region' attribute" % (name, source_file))
+        self._region = options.get(_OPTION_REGION, None)
 
         # Determine if we should flatten the resource properties in environment variables. (Default to true)
         self._flatten = options.get(_OPTION_FLATTEN, 'true').lower() not in ['0', 'no', 'false', 'off']
@@ -90,20 +82,108 @@ class CustomResource(object):
         self._update_timeout = int(options.get(_OPTION_UPDATE_TIMEOUT, timeout))
 
         # Determine our default action
-        action = options.get(_OPTION_DEFAULT_ACTION, None)
+        self._default_action = options.get(_OPTION_DEFAULT_ACTION, None)
+
+        config_provider = options.get(_OPTION_CONFIG_PROVIDER)
+        if config_provider:
+            config = self.get_config_from_config_provider(config_provider)
+            self.override_config(config)
+
+        if not self._queue_url:
+            raise ValueError(u"[%s] in '%s' is missing 'queue_url' attribute" % (name, source_file))
+
+        # Try to parse the region from the queues/sqs prefixed urls.
+        region_match = re.match(r"https?://(?:queue|sqs)\.([^.]+?)\.amazonaws\..+", self._queue_url, re.I | re.U)
+        if region_match:
+            self._region = region_match.group(1)
+
+        if not self._region:
+            raise ValueError(u"[%s] in '%s' must define 'region' attribute" % (name, source_file))
 
         # Set our actions for each type of event
-        self._create_action = options.get(_OPTION_CREATE_ACTION, action)
+        self._create_action = options.get(_OPTION_CREATE_ACTION, self._default_action)
         if not self._create_action:
             raise ValueError(u"[%s] in '%s' must define %s" % (name, source_file, _OPTION_CREATE_ACTION))
 
-        self._delete_action = options.get(_OPTION_DELETE_ACTION, action)
+        self._delete_action = options.get(_OPTION_DELETE_ACTION, self._default_action)
         if not self._delete_action:
             raise ValueError(u"[%s] in '%s' must define %s" % (name, source_file, _OPTION_DELETE_ACTION))
 
-        self._update_action = options.get(_OPTION_UPDATE_ACTION, action)
+        self._update_action = options.get(_OPTION_UPDATE_ACTION, self._default_action)
         if not self._update_action:
             raise ValueError(u"[%s] in '%s' must define %s" % (name, source_file, _OPTION_UPDATE_ACTION))
+
+    def get_config_from_config_provider(self, config_provider):
+        """Retrieve config from config provider.
+
+        @param config_provider: a string of config provider class path that
+            defined get_options for returning dict type of config value.
+        @type config_provider: string
+        @return dict
+
+        Below is an example of a config provider settings.
+
+        #> cat /etc/cfn/cfn-resource-bridge.conf
+
+        [cfn_client]
+        resource_type=Custom::CfnCustom
+        config_provider=example.com.config_provider.CfnBridgeConfigProvider
+
+        #> cat /Library/Python/2.7/site-packages/eaxmple/com/config_provider.py
+
+        class CfnBridgeConfigProvider(object):
+
+            def get_options(self):
+                queue_url = self.get_queue_url_from_aws_dynamodb()
+                return {
+                    'queue_url': queue_url,
+                    'default_action': 'action-default'
+                }
+        """
+        providers = config_provider.rsplit('.', 1)
+        if len(providers) < 2:
+            raise ValueError(
+                'Provide <python file path>.<class name>'
+                'ex) example.com.CfnBrdigeConfigProviderClass')
+
+        module_name = providers[0]
+        class_name = providers[1]
+
+        try:
+            module_provider = importlib.import_module(module_name)
+        except ImportError:
+            raise ValueError(u"Could not import %s" % module_name)
+
+        try:
+            class_provider = getattr(module_provider, class_name)
+        except AttributeError:
+            raise ValueError(u"Class %s is not defined" % class_name)
+
+        class_provider = class_provider()
+
+        try:
+            config = class_provider.get_options()
+        except AttributeError:
+            raise ValueError(u"get_options is not defiend in %s" % class_name)
+        except Exception, ex:
+            raise
+
+        if not isinstance(config, dict):
+            raise ValueError(u"get_options is not returning dict object")
+
+        return config
+
+    def override_config(self, config):
+        """Override static default config values at runtime
+
+        @param config: a dictionary of default config values which may be
+                       overridden as needed
+        @type config: dict
+        @return None
+        """
+        for key, value in config.iteritems():
+            key = '_%s' % key
+            setattr(self, key, value)
 
     @property
     def name(self):
